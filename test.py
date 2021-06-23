@@ -18,7 +18,6 @@ from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized
 
 
-@torch.no_grad()
 def test(data,
          weights=None,
          batch_size=32,
@@ -39,8 +38,7 @@ def test(data,
          wandb_logger=None,
          compute_loss=None,
          half_precision=True,
-         is_coco=False,
-         opt=None):
+         is_coco=False):
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -51,7 +49,7 @@ def test(data,
         device = select_device(opt.device, batch_size=batch_size)
 
         # Directories
-        save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)  # increment run
+        save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
         (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
         # Load model
@@ -73,7 +71,7 @@ def test(data,
     if isinstance(data, str):
         is_coco = data.endswith('coco.yaml')
         with open(data) as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=yaml.SafeLoader)
     check_dataset(data)  # check
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
@@ -106,21 +104,22 @@ def test(data,
         targets = targets.to(device)
         nb, _, height, width = img.shape  # batch size, channels, height, width
 
-        # Run model
-        t = time_synchronized()
-        out, train_out = model(img, augment=augment)  # inference and training outputs
-        t0 += time_synchronized() - t
+        with torch.no_grad():
+            # Run model
+            t = time_synchronized()
+            out, train_out = model(img, augment=augment)  # inference and training outputs
+            t0 += time_synchronized() - t
 
-        # Compute loss
-        if compute_loss:
-            loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+            # Compute loss
+            if compute_loss:
+                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
 
-        # Run NMS
-        targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
-        lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
-        t = time_synchronized()
-        out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls)
-        t1 += time_synchronized() - t
+            # Run NMS
+            targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
+            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
+            t = time_synchronized()
+            out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+            t1 += time_synchronized() - t
 
         # Statistics per image
         for si, pred in enumerate(out):
@@ -136,8 +135,6 @@ def test(data,
                 continue
 
             # Predictions
-            if single_cls:
-                pred[:, 5] = 0
             predn = pred.clone()
             scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # native-space pred
 
@@ -188,8 +185,8 @@ def test(data,
 
                 # Per target class
                 for cls in torch.unique(tcls_tensor):
-                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # target indices
-                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
 
                     # Search for detections
                     if pi.shape[0]:
@@ -289,13 +286,13 @@ def test(data,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--weights', nargs='+', type=str, default='yolov3.pt', help='model.pt path(s)')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='*.data path')
+    parser.add_argument('--data', type=str, default='data/voc.yaml', help='*.data path')
     parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
-    parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--img-size', type=int, default=512, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='3', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--verbose', action='store_true', help='report mAP by class')
@@ -310,7 +307,7 @@ if __name__ == '__main__':
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
     print(opt)
-    check_requirements(exclude=('tensorboard', 'pycocotools', 'thop'))
+    check_requirements()
 
     if opt.task in ('train', 'val', 'test'):  # run normally
         test(opt.data,
@@ -326,12 +323,11 @@ if __name__ == '__main__':
              save_txt=opt.save_txt | opt.save_hybrid,
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
-             opt=opt
              )
 
     elif opt.task == 'speed':  # speed benchmarks
         for w in opt.weights:
-            test(opt.data, w, opt.batch_size, opt.img_size, 0.25, 0.45, save_json=False, plots=False, opt=opt)
+            test(opt.data, w, opt.batch_size, opt.img_size, 0.25, 0.45, save_json=False, plots=False)
 
     elif opt.task == 'study':  # run over a range of settings and save/plot
         # python test.py --task study --data coco.yaml --iou 0.7 --weights yolov3.pt yolov3-spp.pt yolov3-tiny.pt
@@ -342,7 +338,7 @@ if __name__ == '__main__':
             for i in x:  # img-size
                 print(f'\nRunning {f} point {i}...')
                 r, _, t = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
-                               plots=False, opt=opt)
+                               plots=False)
                 y.append(r + t)  # results and times
             np.savetxt(f, y, fmt='%10.4g')  # save
         os.system('zip -r study.zip study_*.txt')
